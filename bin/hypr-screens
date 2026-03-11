@@ -125,6 +125,14 @@ case "$1" in
         done
         ;;
 
+    restore)
+        # Re-apply disabled state (use after unlock/resume)
+        for mon in $(cat "$DISABLED_FILE" 2>/dev/null); do
+            hyprctl keyword monitor "${mon}, disable" > /dev/null 2>&1
+        done
+        signal_waybar
+        ;;
+
     menu)
         # Build walker menu with monitor status
         items=""
