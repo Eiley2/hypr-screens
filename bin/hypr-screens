@@ -1,0 +1,200 @@
+#!/bin/bash
+
+STATE_DIR="$HOME/.cache/hypr-screens"
+DISABLED_FILE="$STATE_DIR/disabled"
+MONITORS_CONF="$HOME/.config/hypr/monitors.conf"
+
+mkdir -p "$STATE_DIR"
+touch "$DISABLED_FILE"
+
+signal_waybar() {
+    pkill -RTMIN+12 waybar 2>/dev/null
+}
+
+# Get the monitor value from monitors.conf (e.g., "DP-1, 1920x1080@100, 1920x0, 1")
+get_monitor_value() {
+    local name="$1"
+    grep "^monitor = ${name}," "$MONITORS_CONF" | head -1 | sed 's/^monitor = //'
+}
+
+is_disabled() {
+    grep -qx "$1" "$DISABLED_FILE" 2>/dev/null
+}
+
+# Get all configurable monitors (non-laptop externals)
+get_externals() {
+    grep '^monitor = ' "$MONITORS_CONF" | sed 's/monitor = //' | cut -d',' -f1 | grep -v 'eDP'
+}
+
+get_all_monitors() {
+    grep '^monitor = ' "$MONITORS_CONF" | sed 's/monitor = //' | cut -d',' -f1
+}
+
+count_active() {
+    local total disabled
+    total=$(get_all_monitors | wc -l)
+    disabled=$(grep -cxE '[A-Za-z].*' "$DISABLED_FILE" 2>/dev/null)
+    disabled=${disabled:-0}
+    echo $((total - disabled))
+}
+
+disable_monitor() {
+    local name="$1"
+    # Never leave zero monitors active
+    if [ "$(count_active)" -le 1 ]; then
+        return 1
+    fi
+    if ! is_disabled "$name"; then
+        echo "$name" >> "$DISABLED_FILE"
+    fi
+    hyprctl keyword monitor "${name}, disable" > /dev/null 2>&1
+    signal_waybar
+}
+
+enable_monitor() {
+    local name="$1"
+    local value
+    value=$(get_monitor_value "$name")
+    if [ -z "$value" ]; then
+        return 1
+    fi
+    # Remove from disabled list
+    local tmp
+    tmp=$(mktemp)
+    grep -vx "$name" "$DISABLED_FILE" > "$tmp" 2>/dev/null
+    mv "$tmp" "$DISABLED_FILE"
+    # Re-apply the original monitor config
+    hyprctl keyword monitor "$value" > /dev/null 2>&1
+    signal_waybar
+}
+
+toggle_monitor() {
+    local name="$1"
+    if is_disabled "$name"; then
+        enable_monitor "$name"
+    else
+        disable_monitor "$name"
+    fi
+}
+
+case "$1" in
+    toggle)
+        toggle_monitor "$2"
+        ;;
+
+    solo)
+        # Disable all externals, keep laptop only
+        for mon in $(get_externals); do
+            disable_monitor "$mon"
+        done
+        ;;
+
+    only)
+        # Pick one monitor to keep, disable all others
+        if [ -n "$2" ]; then
+            keep="$2"
+        else
+            items=""
+            for mon in $(get_all_monitors); do
+                label="$mon"
+                [[ "$mon" == eDP* ]] && label="${mon} (laptop)"
+                items+="${label}\n"
+            done
+            choice=$(printf "%b" "$items" | walker -d -p "  Keep only:")
+            [ -z "$choice" ] && exit 0
+            keep=$(echo "$choice" | grep -oE '(eDP|DP|HDMI|VGA|DVI)-[A-Za-z0-9-]+')
+            [ -z "$keep" ] && exit 0
+        fi
+        # First enable the target in case it's off
+        if is_disabled "$keep"; then
+            enable_monitor "$keep"
+        fi
+        # Then disable everything else
+        for mon in $(get_all_monitors); do
+            [ "$mon" = "$keep" ] && continue
+            disable_monitor "$mon"
+        done
+        ;;
+
+    all)
+        # Enable all monitors
+        for mon in $(get_all_monitors); do
+            if is_disabled "$mon"; then
+                enable_monitor "$mon"
+            fi
+        done
+        ;;
+
+    menu)
+        # Build walker menu with monitor status
+        items=""
+        for mon in $(get_all_monitors); do
+            label="$mon"
+            [[ "$mon" == eDP* ]] && label="${mon} (laptop)"
+            if is_disabled "$mon"; then
+                items+="  ${label} — OFF\n"
+            else
+                items+="  ${label} — ON\n"
+            fi
+        done
+        items+="󰍹  All screens on\n"
+        items+="  Focus mode (laptop only)"
+
+        choice=$(printf "%b" "$items" | walker -d -p "  Screens:")
+        choice=$(echo "$choice" | xargs)
+        [ -z "$choice" ] && exit 0
+
+        case "$choice" in
+            *"All screens on"*)
+                "$0" all
+                ;;
+            *"Focus mode"*|*"laptop only"*)
+                "$0" solo
+                ;;
+            *)
+                # Extract monitor name (e.g., eDP-1, DP-1, HDMI-A-1)
+                mon=$(echo "$choice" | grep -oE '(eDP|DP|HDMI|VGA|DVI)-[A-Za-z0-9-]+')
+                [ -n "$mon" ] && toggle_monitor "$mon"
+                ;;
+        esac
+        ;;
+
+    waybar)
+        total=$(get_all_monitors | wc -l)
+        disabled=$(grep -cxE '[A-Za-z].*' "$DISABLED_FILE" 2>/dev/null)
+        disabled=${disabled:-0}
+        active=$((total - disabled))
+
+        if [ "$active" -eq "$total" ]; then
+            icon="󰍹"
+            class="all"
+        elif [ "$active" -eq 1 ]; then
+            icon=""
+            class="focus"
+        else
+            icon="󰍹"
+            class="partial"
+        fi
+
+        # Build tooltip
+        tip=""
+        for mon in $(get_all_monitors); do
+            if [[ "$mon" == eDP* ]]; then
+                tip+="${mon} (laptop)\\n"
+            elif is_disabled "$mon"; then
+                tip+="${mon}  OFF\\n"
+            else
+                tip+="${mon}  ON\\n"
+            fi
+        done
+        tip+="\\nClick: toggle menu\\nRight-click: focus mode\\nMiddle: all on"
+
+        printf '{"text": "%s %d/%d", "tooltip": "%s", "class": "%s"}\n' \
+            "$icon" "$active" "$total" "$tip" "$class"
+        ;;
+
+    *)
+        echo "Usage: hypr-screens {toggle|solo|all|menu|waybar} [monitor]"
+        exit 1
+        ;;
+esac
